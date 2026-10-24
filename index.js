@@ -37,6 +37,34 @@ const fields = {
   contact: z.string().regex(/^\d{10}$/).optional(),
 };
 
+const GH_TOKEN = process.env.GITHUB_TOKEN;
+const GH_REPO = process.env.GITHUB_REPO;
+const GH_BRANCH = process.env.GITHUB_BRANCH || "main";
+const EDITABLE = ["style.css", "index.html"];
+
+async function ghFetch(file, query = "", options = {}) {
+  if (!GH_TOKEN || !GH_REPO) throw new Error("GitHub is not configured on the server");
+  const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${file}${query}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${GH_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "student-mcp",
+      "Content-Type": "application/json",
+    },
+    signal: AbortSignal.timeout(30000),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.message || `GitHub HTTP ${res.status}`);
+  return body;
+}
+
+async function readFrontendFile(file) {
+  const j = await ghFetch(file, `?ref=${GH_BRANCH}`);
+  return { text: Buffer.from(j.content, "base64").toString("utf8"), sha: j.sha };
+}
+
 function buildServer() {
   const server = new McpServer({ name: "student-api", version: "1.0.0" });
 
@@ -80,6 +108,43 @@ function buildServer() {
     },
     run(({ studentId }) => call(`/${encodeURIComponent(studentId)}`, { method: "DELETE" }))
   );
+
+  server.registerTool(
+  "read_frontend_file",
+  {
+    description: "Read the current contents of a frontend file (style.css or index.html)",
+    inputSchema: { file: z.enum(EDITABLE) },
+  },
+  run(async ({ file }) => (await readFrontendFile(file)).text)
+);
+
+server.registerTool(
+  "write_frontend_file",
+  {
+    description:
+      "Replace a frontend file (style.css or index.html) with new full contents and commit it. " +
+      "Always call read_frontend_file first and send the complete updated file, not a fragment. " +
+      "The live site redeploys shortly after the commit.",
+    inputSchema: {
+      file: z.enum(EDITABLE),
+      content: z.string().min(1).max(100000),
+      message: z.string().max(100).optional(),
+    },
+  },
+  run(async ({ file, content, message }) => {
+    const { sha } = await readFrontendFile(file);
+    await ghFetch(file, "", {
+      method: "PUT",
+      body: JSON.stringify({
+        message: message || `Update ${file} via Claude`,
+        content: Buffer.from(content, "utf8").toString("base64"),
+        sha,
+        branch: GH_BRANCH,
+      }),
+    });
+    return { success: true, message: `${file} committed. The site will redeploy shortly.` };
+  })
+);
 
   return server;
 }
